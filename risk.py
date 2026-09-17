@@ -1,162 +1,288 @@
-"""
-Risk engine tables.
+from fastapi import APIRouter, Depends, HTTPException, status
+from sqlalchemy.orm import Session, joinedload
 
-CRITICAL RULE (PRD Section 4 storage requirement):
-Risk scores are IMMUTABLE and VERSIONED. A recompute NEVER updates an existing risk_scores row —
-it always creates a new RiskRun, then new RiskScore + RiskFactorResult rows tied to that run_id.
-This is what makes /risk/recompute and the audit trail trustworthy. Do not add an "update" path here.
-"""
-import enum
-import uuid
-from datetime import date
-from sqlalchemy import String, ForeignKey, Enum, Float, JSON, Integer, DateTime, Text, func
-from sqlalchemy.orm import Mapped, mapped_column, relationship
-from app.models.base import Base, TimestampMixin
+from app.core.database import get_db
+from app.core.deps import get_current_user, require_roles, check_scope_access
+from app.models import (
+    Project, Location, RiskRun, RiskScore, RiskFactorResult, DuplicateCandidate, PeerBenchmark,
+    Agency, ProjectFinancial, ProjectProgress, Payment, User, RoleName,
+)
+from app.schemas.risk import (
+    RiskScoreOut, FactorResultOut, RiskRunOut, AlertItemOut, DuplicateCandidateOut, PeerBenchmarkOut,
+    ComplianceResultOut, RelatedProjectOut, RelationshipGraphOut,
+)
+from app.services.risk_engine import run_risk_engine
+from app.services.compliance import evaluate_compliance
 
-
-class RiskLevel(str, enum.Enum):
-    LOW = "low"           # 0-29
-    MEDIUM = "medium"      # 30-59
-    HIGH = "high"          # 60-79
-    CRITICAL = "critical"  # 80-100
+router = APIRouter(tags=["risk"])
 
 
-class FactorCode(str, enum.Enum):
-    COST_DEVIATION = "COST_DEVIATION"                          # weight 0.20
-    PROGRESS_EXPENDITURE_MISMATCH = "PROGRESS_EXPENDITURE_MISMATCH"  # weight 0.20
-    DELAY_STALL = "DELAY_STALL"                                # weight 0.15
-    PAYMENT_ANOMALY = "PAYMENT_ANOMALY"                        # weight 0.15
-    DUPLICATE_SIMILARITY = "DUPLICATE_SIMILARITY"              # weight 0.10
-    PEER_DEVIATION = "PEER_DEVIATION"                          # weight 0.10
-    ML_ANOMALY = "ML_ANOMALY"                                  # weight 0.10, capped, Isolation Forest
+def _latest_risk_score(db: Session, project_id: str):
+    return (
+        db.query(RiskScore)
+        .filter(RiskScore.project_id == project_id)
+        .order_by(RiskScore.created_at.desc())
+        .first()
+    )
 
 
-# Canonical weights — import this dict wherever the scoring formula is implemented,
-# never hard-code the numbers a second time.
-FACTOR_WEIGHTS = {
-    FactorCode.COST_DEVIATION: 0.20,
-    FactorCode.PROGRESS_EXPENDITURE_MISMATCH: 0.20,
-    FactorCode.DELAY_STALL: 0.15,
-    FactorCode.PAYMENT_ANOMALY: 0.15,
-    FactorCode.DUPLICATE_SIMILARITY: 0.10,
-    FactorCode.PEER_DEVIATION: 0.10,
-    FactorCode.ML_ANOMALY: 0.10,
-}
+@router.post("/risk/recompute", response_model=RiskRunOut)
+def recompute_risk(
+    current_user: User = Depends(require_roles(RoleName.SYSTEM_ADMIN, RoleName.MINISTRY_ADMIN)),
+    db: Session = Depends(get_db),
+):
+    """Scores every project. Restricted to admin roles -- recompute is a heavy, system-wide action,
+    not something a district reviewer should be able to trigger for the whole country."""
+    risk_run = run_risk_engine(db, triggered_by_user_id=current_user.id)
+    return risk_run
 
 
-class RiskRun(TimestampMixin, Base):
-    """One execution of the risk engine across some/all projects. Every recompute creates a new row here."""
-    __tablename__ = "risk_runs"
-
-    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
-    engine_version: Mapped[str] = mapped_column(String(50), nullable=False)  # matches RISK_ENGINE_VERSION env
-    triggered_by_user_id: Mapped[str | None] = mapped_column(String(36), ForeignKey("users.id"), nullable=True)
-    started_at: Mapped[DateTime] = mapped_column(DateTime(timezone=True), server_default=func.now())
-    completed_at: Mapped[DateTime | None] = mapped_column(DateTime(timezone=True), nullable=True)
-    project_count: Mapped[int] = mapped_column(Integer, default=0)
-    notes: Mapped[str | None] = mapped_column(Text, nullable=True)
-
-    scores: Mapped[list["RiskScore"]] = relationship(back_populates="risk_run", cascade="all, delete-orphan")
+@router.get("/risk/runs/{run_id}", response_model=RiskRunOut)
+def get_risk_run(run_id: str, db: Session = Depends(get_db), _user: User = Depends(get_current_user)):
+    risk_run = db.query(RiskRun).filter(RiskRun.id == run_id).first()
+    if not risk_run:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Risk run not found")
+    return risk_run
 
 
-class RiskScore(TimestampMixin, Base):
-    """One project's final score for one risk run. Never updated after creation — insert-only."""
-    __tablename__ = "risk_scores"
+@router.get("/projects/{project_id}/risk", response_model=RiskScoreOut)
+def get_project_risk(
+    project_id: str, db: Session = Depends(get_db), user: User = Depends(get_current_user),
+):
+    project = (
+        db.query(Project).options(joinedload(Project.location))
+        .filter(Project.id == project_id).first()
+    )
+    if not project:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Project not found")
 
-    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
-    risk_run_id: Mapped[str] = mapped_column(String(36), ForeignKey("risk_runs.id"), nullable=False, index=True)
-    project_id: Mapped[str] = mapped_column(String(36), ForeignKey("projects.id"), nullable=False, index=True)
-    final_score: Mapped[float] = mapped_column(Float, nullable=False)  # 0-100, Σ(w_i * s_i) / Σ(w_i)
-    risk_level: Mapped[RiskLevel] = mapped_column(Enum(RiskLevel), nullable=False, index=True)
-    factors_computed_count: Mapped[int] = mapped_column(Integer, nullable=False)  # |A| in the formula
-    evidence_completeness_percent: Mapped[float] = mapped_column(Float, nullable=False)
+    if not check_scope_access(
+        user,
+        state=project.location.state if project.location else None,
+        district=project.location.district if project.location else None,
+    ):
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "Out of scope for this user")
 
-    risk_run: Mapped["RiskRun"] = relationship(back_populates="scores")
-    factor_results: Mapped[list["RiskFactorResult"]] = relationship(back_populates="risk_score", cascade="all, delete-orphan")
+    score = _latest_risk_score(db, project_id)
+    if not score:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "No risk score yet -- run /risk/recompute first")
 
+    factors = (
+        db.query(RiskFactorResult).filter(RiskFactorResult.risk_score_id == score.id).all()
+    )
+    risk_run = db.query(RiskRun).filter(RiskRun.id == score.risk_run_id).first()
 
-class RiskFactorResult(TimestampMixin, Base):
-    """
-    One factor's contribution to one risk score. This is what makes the platform explainable —
-    the Project Risk Profile screen renders these as evidence cards. Every field here is mandatory,
-    per PRD explainability requirement ("never show a bare AI number").
-    """
-    __tablename__ = "risk_factor_results"
-
-    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
-    risk_score_id: Mapped[str] = mapped_column(String(36), ForeignKey("risk_scores.id"), nullable=False, index=True)
-    factor_code: Mapped[FactorCode] = mapped_column(Enum(FactorCode), nullable=False)
-    raw_value: Mapped[float | None] = mapped_column(Float, nullable=True)
-    normalized_score: Mapped[float] = mapped_column(Float, nullable=False)  # 0-100
-    weight: Mapped[float] = mapped_column(Float, nullable=False)
-    contribution: Mapped[float] = mapped_column(Float, nullable=False)  # weight * normalized_score
-    evidence: Mapped[dict] = mapped_column(JSON, nullable=False)  # peer group, sample size, comparison values, etc.
-    explanation: Mapped[str] = mapped_column(Text, nullable=False)  # human-readable: "what/compared to what/how much"
-    detector_version: Mapped[str] = mapped_column(String(50), nullable=False)
-
-    risk_score: Mapped["RiskScore"] = relationship(back_populates="factor_results")
-
-
-class Anomaly(TimestampMixin, Base):
-    """Raw detector output, independent of the weighted score — used for the Alerts/Early-Warning list views."""
-    __tablename__ = "anomalies"
-
-    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
-    project_id: Mapped[str] = mapped_column(String(36), ForeignKey("projects.id"), nullable=False, index=True)
-    risk_run_id: Mapped[str] = mapped_column(String(36), ForeignKey("risk_runs.id"), nullable=False, index=True)
-    anomaly_type: Mapped[str] = mapped_column(String(100), nullable=False, index=True)  # e.g. "stall", "cost_outlier"
-    severity: Mapped[str] = mapped_column(String(20), nullable=False)
-    description: Mapped[str] = mapped_column(Text, nullable=False)
-    evidence: Mapped[dict] = mapped_column(JSON, nullable=False)
+    return RiskScoreOut(
+        project_id=project.id,
+        project_code=project.project_code,
+        final_score=score.final_score,
+        risk_level=score.risk_level.value,
+        factors_computed_count=score.factors_computed_count,
+        evidence_completeness_percent=score.evidence_completeness_percent,
+        risk_run_id=score.risk_run_id,
+        engine_version=risk_run.engine_version if risk_run else "unknown",
+        factors=[
+            FactorResultOut(
+                factor_code=f.factor_code.value, raw_value=f.raw_value, normalized_score=f.normalized_score,
+                weight=f.weight, contribution=f.contribution, evidence=f.evidence,
+                explanation=f.explanation, detector_version=f.detector_version,
+            )
+            for f in factors
+        ],
+    )
 
 
-class PeerBenchmark(TimestampMixin, Base):
-    """Snapshot of a peer group's stats at the time of a risk run — stored so evidence stays auditable later."""
-    __tablename__ = "peer_benchmarks"
+@router.get("/projects/{project_id}/duplicates", response_model=list[DuplicateCandidateOut])
+def get_project_duplicates(
+    project_id: str, db: Session = Depends(get_db), user: User = Depends(get_current_user),
+):
+    """Possible-duplicate candidates for this project, from the most recent risk run.
+    Never labelled 'confirmed duplicate' anywhere -- ui_label is possible/strong/very_strong only."""
+    project = (
+        db.query(Project).options(joinedload(Project.location)).filter(Project.id == project_id).first()
+    )
+    if not project:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Project not found")
+    if not check_scope_access(
+        user, state=project.location.state if project.location else None,
+        district=project.location.district if project.location else None,
+    ):
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "Out of scope for this user")
 
-    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
-    risk_run_id: Mapped[str] = mapped_column(String(36), ForeignKey("risk_runs.id"), nullable=False, index=True)
-    work_type: Mapped[str] = mapped_column(String(100), nullable=False)
-    group_level: Mapped[str] = mapped_column(String(50), nullable=False)  # district/state/national fallback tier used
-    group_value: Mapped[str | None] = mapped_column(String(150), nullable=True)
-    sample_count: Mapped[int] = mapped_column(Integer, nullable=False)  # must be >= 10 to be used
-    median_cost: Mapped[float] = mapped_column(Float, nullable=False)
-    iqr_low: Mapped[float] = mapped_column(Float, nullable=False)
-    iqr_high: Mapped[float] = mapped_column(Float, nullable=False)
-
-
-class DuplicateCandidate(TimestampMixin, Base):
-    """Never call this 'confirmed duplicate' anywhere in the UI — it's always a candidate for human review."""
-    __tablename__ = "duplicate_candidates"
-
-    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
-    project_id: Mapped[str] = mapped_column(String(36), ForeignKey("projects.id"), nullable=False, index=True)
-    candidate_project_id: Mapped[str] = mapped_column(String(36), ForeignKey("projects.id"), nullable=False, index=True)
-    text_similarity: Mapped[float] = mapped_column(Float, nullable=False)
-    geographic_similarity: Mapped[float] = mapped_column(Float, nullable=False)
-    attribute_similarity: Mapped[float] = mapped_column(Float, nullable=False)
-    combined_score: Mapped[float] = mapped_column(Float, nullable=False)  # 0.60*text + 0.25*geo + 0.15*attr
-    ui_label: Mapped[str] = mapped_column(String(50), nullable=False)  # "possible" / "strong" / "very strong"
+    return (
+        db.query(DuplicateCandidate)
+        .filter(DuplicateCandidate.project_id == project_id)
+        .order_by(DuplicateCandidate.combined_score.desc())
+        .all()
+    )
 
 
-class ProjectRelationship(TimestampMixin, Base):
-    """Edges for the relationship/evidence graph: Project -> Agency/Location/Payment/Related-Project (P1 feature)."""
-    __tablename__ = "project_relationships"
+@router.get("/projects/{project_id}/benchmark", response_model=PeerBenchmarkOut)
+def get_project_benchmark(
+    project_id: str, db: Session = Depends(get_db), user: User = Depends(get_current_user),
+):
+    """The peer group (district -> state -> national fallback) actually used for this
+    project's COST_DEVIATION factor in the most recent risk run, with sample size and IQR."""
+    project = (
+        db.query(Project).options(joinedload(Project.location)).filter(Project.id == project_id).first()
+    )
+    if not project:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Project not found")
+    if not check_scope_access(
+        user, state=project.location.state if project.location else None,
+        district=project.location.district if project.location else None,
+    ):
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "Out of scope for this user")
 
-    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
-    from_project_id: Mapped[str] = mapped_column(String(36), ForeignKey("projects.id"), nullable=False, index=True)
-    to_project_id: Mapped[str] = mapped_column(String(36), ForeignKey("projects.id"), nullable=False, index=True)
-    relationship_type: Mapped[str] = mapped_column(String(100), nullable=False)  # "same_agency", "same_location", etc.
-    strength: Mapped[float | None] = mapped_column(Float, nullable=True)
+    latest_run = db.query(RiskRun).order_by(RiskRun.created_at.desc()).first()
+    if not latest_run:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "No risk run yet -- run /risk/recompute first")
+
+    district = project.location.district if project.location else None
+    state = project.location.state if project.location else None
+
+    q = db.query(PeerBenchmark).filter(
+        PeerBenchmark.risk_run_id == latest_run.id, PeerBenchmark.work_type == project.work_type,
+    )
+    benchmark = (
+        q.filter(PeerBenchmark.group_level == "district", PeerBenchmark.group_value == district).first()
+        or q.filter(PeerBenchmark.group_level == "state", PeerBenchmark.group_value == state).first()
+        or q.filter(PeerBenchmark.group_level == "national").first()
+    )
+    if not benchmark:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "No peer benchmark available for this project's group")
+
+    return PeerBenchmarkOut(
+        work_type=benchmark.work_type, group_level=benchmark.group_level, group_value=benchmark.group_value,
+        sample_count=benchmark.sample_count, median_cost=benchmark.median_cost,
+        iqr_low=benchmark.iqr_low, iqr_high=benchmark.iqr_high, project_cost=float(project.sanctioned_amount),
+    )
 
 
-class ComplianceCheck(TimestampMixin, Base):
-    """CMP-001..CMP-007 results per project per run. PASS/WARNING/FAIL (P1 feature)."""
-    __tablename__ = "compliance_checks"
+def _load_scoped_project(db: Session, user: User, project_id: str) -> Project:
+    project = (
+        db.query(Project).options(joinedload(Project.location), joinedload(Project.agency))
+        .filter(Project.id == project_id).first()
+    )
+    if not project:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Project not found")
+    if not check_scope_access(
+        user, state=project.location.state if project.location else None,
+        district=project.location.district if project.location else None,
+    ):
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "Out of scope for this user")
+    return project
 
-    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
-    project_id: Mapped[str] = mapped_column(String(36), ForeignKey("projects.id"), nullable=False, index=True)
-    risk_run_id: Mapped[str] = mapped_column(String(36), ForeignKey("risk_runs.id"), nullable=False, index=True)
-    check_code: Mapped[str] = mapped_column(String(20), nullable=False)  # e.g. "CMP-002"
-    result: Mapped[str] = mapped_column(String(20), nullable=False)  # PASS / WARNING / FAIL
-    evidence: Mapped[dict] = mapped_column(JSON, nullable=False)
+
+@router.get("/projects/{project_id}/compliance", response_model=list[ComplianceResultOut])
+def get_project_compliance(
+    project_id: str, db: Session = Depends(get_db), user: User = Depends(get_current_user),
+):
+    """Live-computed CMP-00x checks (see app/services/compliance.py) -- not read from the
+    ComplianceCheck table, since nothing populates it yet. Recomputed on every call from
+    current Project/Payment/Financial/Progress data, which is cheap for a single project."""
+    project = _load_scoped_project(db, user, project_id)
+    latest_financial = (
+        db.query(ProjectFinancial).filter(ProjectFinancial.project_id == project_id)
+        .order_by(ProjectFinancial.as_of_date.desc()).first()
+    )
+    latest_progress = (
+        db.query(ProjectProgress).filter(ProjectProgress.project_id == project_id)
+        .order_by(ProjectProgress.report_date.desc()).first()
+    )
+    payments = db.query(Payment).filter(Payment.project_id == project_id).all()
+
+    checks = evaluate_compliance(project, latest_financial, latest_progress, payments)
+    return [
+        ComplianceResultOut(project_id=project.id, project_code=project.project_code, **c)
+        for c in checks
+    ]
+
+
+@router.get("/projects/{project_id}/relationships", response_model=RelationshipGraphOut)
+def get_project_relationships(
+    project_id: str, db: Session = Depends(get_db), user: User = Depends(get_current_user),
+):
+    """Project -> Agency -> Location -> Payments -> Related Projects, computed live from
+    existing foreign keys (same agency_id / same location_id) -- NOT from the ProjectRelationship
+    table, since nothing writes to it yet. No graph database, no ML -- plain SQL joins."""
+    project = _load_scoped_project(db, user, project_id)
+
+    payments = db.query(Payment).filter(Payment.project_id == project_id).all()
+    payment_count = len(payments)
+    payment_total_amount = float(sum(p.payment_amount for p in payments))
+
+    related: list[RelatedProjectOut] = []
+    if project.agency_id:
+        same_agency = (
+            db.query(Project).filter(Project.agency_id == project.agency_id, Project.id != project.id)
+            .limit(10).all()
+        )
+        related += [
+            RelatedProjectOut(id=p.id, project_code=p.project_code, title=p.title, relationship_type="same_agency")
+            for p in same_agency
+        ]
+    if project.location_id:
+        same_location = (
+            db.query(Project).filter(Project.location_id == project.location_id, Project.id != project.id)
+            .limit(10).all()
+        )
+        related += [
+            RelatedProjectOut(id=p.id, project_code=p.project_code, title=p.title, relationship_type="same_location")
+            for p in same_location
+        ]
+
+    return RelationshipGraphOut(
+        project={"id": project.id, "project_code": project.project_code, "title": project.title},
+        agency={"id": project.agency.id, "name": project.agency.name} if project.agency else None,
+        location={"state": project.location.state, "district": project.location.district} if project.location else None,
+        payment_summary={"count": payment_count, "total_amount": payment_total_amount},
+        related_projects=related,
+    )
+
+
+@router.get("/alerts", response_model=list[AlertItemOut])
+def get_alerts(
+    min_level: str = "high",
+    limit: int = 50,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """Ranked review queue. Scoped automatically -- district/state users only see their own alerts.
+    min_level: 'critical', 'high' (default, includes critical), 'medium', or 'low' (shows everything)."""
+    level_order = {"low": 0, "medium": 1, "high": 2, "critical": 3}
+    threshold = level_order.get(min_level.lower(), 2)
+
+    latest_run = db.query(RiskRun).order_by(RiskRun.created_at.desc()).first()
+    if not latest_run:
+        return []
+
+    q = (
+        db.query(RiskScore, Project, Location)
+        .join(Project, RiskScore.project_id == Project.id)
+        .outerjoin(Location, Project.location_id == Location.id)
+        .filter(RiskScore.risk_run_id == latest_run.id)
+    )
+
+    results = []
+    for score, project, location in q.all():
+        score_level_rank = level_order[score.risk_level.value]
+        if score_level_rank < threshold:
+            continue
+        if not check_scope_access(user, state=location.state if location else None,
+                                    district=location.district if location else None):
+            continue
+
+        top_factor = (
+            db.query(RiskFactorResult).filter(RiskFactorResult.risk_score_id == score.id)
+            .order_by(RiskFactorResult.contribution.desc()).first()
+        )
+        results.append(AlertItemOut(
+            project_id=project.id, project_code=project.project_code, title=project.title,
+            final_score=score.final_score, risk_level=score.risk_level.value,
+            top_factor_code=top_factor.factor_code.value if top_factor else None,
+            top_factor_explanation=top_factor.explanation if top_factor else None,
+        ))
+
+    results.sort(key=lambda r: r.final_score, reverse=True)
+    return results[:limit]
