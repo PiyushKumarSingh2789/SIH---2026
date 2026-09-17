@@ -1,0 +1,60 @@
+@import url('https://fonts.googleapis.com/css2?family=Newsreader:ital,opsz,wght@0,6..72,400;0,6..72,500;0,6..72,600;0,6..72,700;1,6..72,500&family=IBM+Plex+Sans:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500;600&display=swap');
+@import "tailwindcss";
+
+@theme {
+  /* Enterprise/government palette -- exact spec. Navy anchors identity; risk colors are
+     reserved strictly for risk information, never used decoratively elsewhere. */
+  --color-ink: #12233d;           /* primary navy */
+  --color-ink-soft: #1e3a5f;      /* secondary navy */
+  --color-paper: #f5f7fa;         /* page background */
+  --color-paper-raised: #ffffff;  /* card */
+  --color-hairline: #e2e8f0;      /* border */
+  --color-slate: #64748b;         /* secondary text */
+  --color-slate-light: #94a3b8;
+  --color-accent: #2563eb;        /* AI/interactive blue */
+  --color-info: #0891b2;
+
+  --color-risk-low: #16a34a;
+  --color-risk-low-bg: #dcfce7;
+  --color-risk-medium: #d97706;
+  --color-risk-medium-bg: #fef3c7;
+  --color-risk-high: #ea580c;
+  --color-risk-high-bg: #ffedd5;
+  --color-risk-critical: #dc2626;
+  --color-risk-critical-bg: #fee2e2;
+
+  --font-display: 'Newsreader', Georgia, serif;
+  --font-sans: 'IBM Plex Sans', system-ui, sans-serif;
+  --font-mono: 'IBM Plex Mono', 'Courier New', monospace;
+}
+
+body {
+  background-color: var(--color-paper);
+  color: var(--color-ink);
+  font-family: var(--font-sans);
+}
+
+:focus-visible {
+  outline: 2px solid var(--color-accent);
+  outline-offset: 2px;
+}
+
+@keyframes toast-in {
+  from { opacity: 0; transform: translateY(-6px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+.animate-toast-in { animation: toast-in 0.15s ease-out; }
+
+@keyframes skeleton-pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.5; }
+}
+.animate-skeleton { animation: skeleton-pulse 1.5s ease-in-out infinite; }
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}
